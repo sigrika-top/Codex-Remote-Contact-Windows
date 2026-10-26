@@ -1,8 +1,8 @@
-# Codex Remote Contact
+# Codex Remote Contact Windows
 
-在你自己的电脑上运行的本地联系中枢。它把网页控制台、QQ / OneBot 和 Codex CLI 接到同一个本地服务里，用来查看状态、切换通道和生成回复。
+在你自己的 Windows 电脑上运行的本地联系中枢。它把网页控制台、QQ / OneBot 和 Codex CLI 接到同一个本地服务里，用来查看状态、切换通道和生成回复。
 
-这个仓库是 Windows 可用版本。macOS 原来依赖的 iMessage、Swift 客户端和 launchd 仍然留在项目里，但只在 macOS 上生效。
+macOS 原来依赖的 iMessage、Swift 客户端和 launchd 仍然留在项目里，但只在 macOS 上生效。
 
 ## 为什么从苹果系统改到 Windows
 
