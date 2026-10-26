@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "updatedAt": "2026-10-26T12:42:34.467Z",
+  "ai": {
+    "model": "gpt-5.4-mini",
+    "reasoningEffort": "low",
+    "imessageModel": "gpt-5.4",
+    "imessageReasoningEffort": "medium"
+  },
+  "qq": {
+    "allowedGroups": [],
+    "ownerUserIds": [],
+    "bannedUserIds": [],
+    "enhancer": {
+      "enabled": true
+    },
+    "proactive": {
+      "enabled": true,
+      "minIntervalMs": 180000
+    }
+  },
+  "imessage": {
+    "trustedHandles": [],
+    "replyHandle": ""
+  },
+  "remoteExecution": {
+    "model": "gpt-5.4",
+    "reasoningEffort": "medium",
+    "skill": "none"
+  },
+  "unifiedMemory": {
+    "autoWriteOnSkillRecall": false,
+    "autoWriteOnIMessageRecall": true,
+    "manualHandoffCommand": true
+  },
+  "branding": {
+    "assistantName": "assistant",
+    "ownerLabel": "管理员",
+    "userAgent": "codexremotecontact/0.1",
+    "assistantMentions": [
+      "@assistant"
+    ]
+  }
+}
