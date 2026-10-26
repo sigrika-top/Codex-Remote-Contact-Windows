@@ -49,6 +49,7 @@ Windows 版本保留了不依赖苹果系统的部分：
 
 1. 安装 Node.js 20 或更高版本，然后重新打开终端。
 2. 进入克隆下来的项目目录。
+3. 编辑 `data/settings.json`。填入你自己的 QQ 群号和管理员 QQ 号；暂时不用 QQ 时可以保持数组为空。
 
 ```json
 {
@@ -65,7 +66,7 @@ Windows 版本保留了不依赖苹果系统的部分：
 }
 ```
 
-3. 安装并登录 Codex CLI。Windows 可以使用官方安装脚本：
+4. 安装并登录 Codex CLI。Windows 可以使用官方安装脚本：
 
 ```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
@@ -83,13 +84,13 @@ npm install -g @openai/codex
 $env:CODEX_CLI_PATH = "C:\path\to\codex.exe"
 ```
 
-4. 启动：
+5. 启动：
 
 ```powershell
 .\modules\start-hub.bat
 ```
 
-5. 打开 [http://localhost:3789](http://localhost:3789)。
+6. 打开 [http://localhost:3789](http://localhost:3789)。
 
 停止：
 
