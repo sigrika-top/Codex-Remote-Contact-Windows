@@ -1,6 +1,6 @@
 # Codex Remote Contact Windows
 
-在你自己的 Windows 电脑上运行的本地联系中枢。它把网页控制台、QQ / OneBot 和 Codex CLI 接到同一个本地服务里，用来查看状态、切换通道和生成回复。
+在你自己的 Windows 电脑上运行的本地联系中枢。它把网页控制台、QQ / OneBot 和 Codex CLI 接到同一个本地服务里，用来查看状态、切换通道和生成回复。QQ 回复默认复用常驻的 Codex app-server 进程，并按聊天分别保存会话号。
 
 macOS 原来依赖的 iMessage、Swift 客户端和 launchd 仍然留在项目里，但只在 macOS 上生效。
 
@@ -92,6 +92,17 @@ $env:CODEX_CLI_PATH = "C:\path\to\codex.exe"
 
 6. 打开 [http://localhost:3789](http://localhost:3789)。
 
+QQ 回复默认使用持久 `codex app-server`；同一私聊或群聊会续接原会话。会话号只保存在本机 `data/qq-sessions.json`。消息含图片时，Hub 会通过 OneBot 获取图片并交给模型；图片获取失败会请对方重发。
+
+如果 Codex 需要走本机代理，在启动前设置代理地址，例如：
+
+```powershell
+$env:CODEX_REMOTE_CONTACT_PROXY_URL = "http://127.0.0.1:7890"
+.\modules\start-hub.bat
+```
+
+没有代理时不要设置此变量。仓库不会替你启用代理或登录账号。
+
 停止：
 
 ```powershell
@@ -117,7 +128,7 @@ Windows 服务器使用 `modules\start-hub.bat`。
 
 ### 系统版本过低，装不上 Codex 桌面版
 
-Codex 桌面应用对系统版本有要求。服务器系统过旧、没有图形界面，或者安装程序直接拒绝安装时，不要继续安装桌面版，改为安装命令行版本。Hub 生成回复时调用的是 `codex` 命令，不需要桌面窗口。
+Codex 桌面应用对系统版本有要求。服务器系统过旧、没有图形界面，或者安装程序直接拒绝安装时，改为安装命令行版本。Hub 生成 QQ 回复时通过 `codex app-server` 与命令行组件通信，不需要桌面窗口。
 
 Linux 或 macOS 服务器：
 
@@ -140,6 +151,7 @@ codex
 - 用防火墙限制 `3789` 端口，只允许你自己的地址访问。
 - 在服务器上单独登录 Codex CLI。登录状态保存在那台机器的用户目录，不会从你的个人电脑自动带过去。
 - QQ 桥如果也运行在服务器上，把 `ONEBOT_API_BASE` 指到那台机器上的桥接地址。
+- `modules/run-hub-task.ps1` 和 `modules/watch-hub.ps1` 可用于 Windows 计划任务托管；任务本身需要在目标电脑上单独注册。运行中的 QQ 客户端及交互式任务通常需要用户保持登录。
 
 ## 网页控制台
 
@@ -178,8 +190,12 @@ Windows 上的 iMessage 开关是关闭的，点击不会开启。这是预期�
 | `ONEBOT_API_BASE` | OneBot 桥接地址，默认 `http://127.0.0.1:3000`。 |
 | `CODEX_REMOTE_CONTACT_CODEX_MODEL` | QQ 通道使用的模型。 |
 | `CODEX_REMOTE_CONTACT_ASSISTANT_PROFILE_PATH` | 可选的助手语气说明文件，使用绝对路径。 |
+| `CODEX_REMOTE_CONTACT_PROXY_URL` | QQ Codex 子进程和 Node 网络请求使用的代理地址；不设置时沿用系统环境变量或直连。 |
+| `CODEX_QQ_TRANSPORT` | 默认使用常驻 app-server；设为 `exec` 可回退到逐条 CLI 调用。 |
 
 模型名称以你的 Codex 账号当前可用的模型为准。
+
+不要把服务器上实际使用的 `data/settings.json`、`data/qq-memory.json`、`data/qq-personas.json`、`data/qq-sessions.json`、`runtime/` 或 Codex 登录文件提交到 Git。仓库中现有的 JSON 是空白示例；部署时请在目标机器上单独配置和保存运行数据。
 
 ## 故障排查
 

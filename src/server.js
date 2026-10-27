@@ -1,7 +1,12 @@
 import { createServer } from "node:http";
+import { runQqCodexJson } from "./qq-codex-runner.mjs";
+import { QqAppServer } from "./qq-app-server.mjs";
+import { extractOneBotImageInputs as fallbackExtractOneBotImageInputs,
+  formatQqImageSummary as fallbackFormatQqImageSummary,
+  prepareQqModelImages as fallbackPrepareQqModelImages } from "./qq-image-fallback.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { access, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -70,6 +75,7 @@ const codexDesktopCacheDir = isWindows
 const settingsPath = join(dataDir, "settings.json");
 const qqMemoryPath = join(dataDir, "qq-memory.json");
 const qqPersonasPath = join(dataDir, "qq-personas.json");
+const qqSessionsPath = join(dataDir, "qq-sessions.json");
 const imessageMemoryPath = join(dataDir, "imessage-memory.json");
 const remoteExecutionMemoryPath = join(dataDir, "remote-execution-memory.json");
 const unifiedMemoryPath = join(dataDir, "unified-memory.json");
@@ -124,10 +130,10 @@ let sendQqGroupBubbles = async ({ event, reply, sendGroupMessage, quoteFirstBubb
 let shouldProactivelyReplyToQq = () => ({ ok: false, reason: "qq-enhancer module is not installed" });
 let buildQqStickerCatalog = async () => [];
 let buildQqImageSegment = (filePath) => ({ type: "image", data: { file: `file://${filePath}` } });
-let extractOneBotImageInputs = () => [];
-let formatQqImageSummary = () => "";
+let extractOneBotImageInputs = fallbackExtractOneBotImageInputs;
+let formatQqImageSummary = fallbackFormatQqImageSummary;
 let formatQqStickerCatalog = () => "";
-let prepareQqModelImages = async () => [];
+let prepareQqModelImages = fallbackPrepareQqModelImages;
 let resolveQqReplyMedia = async () => [];
 let stripQqImageAttachmentMarkers = (text) => String(text || "").trim();
 
@@ -211,8 +217,16 @@ const qqProactiveMinIntervalMs = Number(process.env.CODEX_REMOTE_CONTACT_QQ_PROA
 const imessageMemoryLimit = Number(process.env.CODEX_REMOTE_CONTACT_IMESSAGE_MEMORY_LIMIT || 120);
 const remoteExecutionMemoryLimit = Number(process.env.CODEX_REMOTE_CONTACT_REMOTE_EXECUTION_MEMORY_LIMIT || 160);
 const remoteExecutionIdleTtlMs = Number(process.env.CODEX_REMOTE_CONTACT_REMOTE_EXECUTION_IDLE_TTL_MS || 15 * 60 * 1000);
+const qqProxyUrl = process.env.CODEX_REMOTE_CONTACT_PROXY_URL || "";
+const qqCodexEnv = { ...process.env, CODEX_REMOTE_CONTACT_QQ_MODE: "1" };
+if (qqProxyUrl) {
+  qqCodexEnv.HTTP_PROXY = qqProxyUrl;
+  qqCodexEnv.HTTPS_PROXY = qqProxyUrl;
+  qqCodexEnv.ALL_PROXY = qqProxyUrl;
+}
+qqCodexEnv.NO_PROXY = [qqCodexEnv.NO_PROXY, "localhost", "127.0.0.1", "::1"].filter(Boolean).join(",");
 const qqWebLookupEnabled = process.env.CODEX_REMOTE_CONTACT_QQ_WEB_LOOKUP !== "0";
-const qqWebLookupTimeoutMs = Number(process.env.CODEX_REMOTE_CONTACT_QQ_WEB_TIMEOUT_MS || 12000);
+const qqWebLookupTimeoutMs = Number(process.env.CODEX_REMOTE_CONTACT_QQ_WEB_TIMEOUT_MS || 5000);
 const qqWebSearchProvider = String(process.env.CODEX_REMOTE_CONTACT_QQ_WEB_PROVIDER || "auto").trim().toLowerCase();
 const proxyShortcutName = process.env.CODEX_REMOTE_CONTACT_PROXY_TOGGLE_SHORTCUT || "切换VPN";
 const proxyConfirmTtlMs = Number(process.env.CODEX_REMOTE_CONTACT_PROXY_CONFIRM_TTL_MS || 3 * 60 * 1000);
@@ -342,6 +356,9 @@ const state = {
   }
 };
 
+const qqReplyTasks = new Map();
+let qqCatalogContents = "";
+let qqCatalogWriteTask = Promise.resolve();
 const seenOneBotMessageIds = new Map();
 const seenMessageTtlMs = 10 * 60 * 1000;
 let imessagePollTimer = null;
@@ -403,6 +420,120 @@ async function loadQqMemory() {
   }
 }
 
+let qqSessions = {};
+
+async function loadQqSessions() {
+  await mkdir(dataDir, { recursive: true });
+  try {
+    const body = JSON.parse(await readFile(qqSessionsPath, "utf8"));
+    if (body && typeof body.sessions === "object" && body.sessions) qqSessions = body.sessions;
+  } catch (error) {
+    if (error.code !== "ENOENT") console.warn(`Unable to load QQ sessions: ${error.message}`);
+  }
+}
+
+let qqSessionsSaveTask = Promise.resolve();
+async function saveQqSessions() {
+  qqSessionsSaveTask = qqSessionsSaveTask.catch(() => null).then(async () => {
+    await mkdir(dataDir, { recursive: true });
+    const temporary = `${qqSessionsPath}.tmp`;
+    await writeFile(temporary, JSON.stringify({ version: 1,
+      updatedAt: new Date().toISOString(), sessions: qqSessions }, null, 2));
+    await rename(temporary, qqSessionsPath);
+  });
+  return qqSessionsSaveTask;
+}
+
+async function clearQqSessions(key) {
+  if (key) delete qqSessions[key];
+  else qqSessions = {};
+  await saveQqSessions();
+}
+
+function qqConversationKey(event) {
+  if (event?.type === "private_message" && event.senderId) return `private:${event.senderId}`;
+  if (event?.groupId) return `group:${event.groupId}`;
+  return "";
+}
+
+function extractCodexSessionId(stderr) {
+  const match = String(stderr || "").match(/session id:\s*([0-9a-f-]+)/i);
+  return match?.[1] || "";
+}
+
+async function getQqCatalogArgs() {
+  try {
+    // Reuse the authenticated CLI's own metadata, never its auth tokens. Unknown
+    // models fall back to normal discovery instead of being silently remapped.
+    const cache = JSON.parse(await readFile(join(codexHomeDir, "models_cache.json"), "utf8"));
+    if (!cache.models?.some(model => model.slug === state.ai.model)) return [];
+    const catalogPath = join(projectDir, "runtime", "qq-model-catalog.json");
+    const contents = JSON.stringify({ models: cache.models });
+    qqCatalogWriteTask = qqCatalogWriteTask.catch(() => null).then(async () => {
+      if (contents !== qqCatalogContents) {
+        await writeFile(catalogPath, contents);
+        qqCatalogContents = contents;
+      }
+    });
+    await qqCatalogWriteTask;
+    return ["-c", `model_catalog_json=${JSON.stringify(catalogPath)}`];
+  } catch {
+    return [];
+  }
+}
+
+function buildQqCodexArgs({ sessionId, outputPath, imagePaths, catalogArgs = [] }) {
+  const imageArgs = (imagePaths || []).flatMap((imagePath) => ["--image", imagePath]);
+  const chatArgs = [
+    "--json",
+    "--disable", "apps", "--disable", "plugins", "--disable", "remote_plugin",
+    "--disable", "shell_snapshot", "--disable", "shell_tool", "--disable", "skill_search",
+    "-c", "agents.enabled=false",
+    "-c", "skills.bundled.enabled=false",
+    "-c", "skills.include_instructions=false",
+    "-c", `model_instructions_file=${JSON.stringify(join(__dirname, "qq-model-instructions.txt"))}`,
+    ...catalogArgs
+  ];
+  if (sessionId) {
+    return [
+      "exec",
+      "resume",
+      "--ignore-user-config",
+      "--skip-git-repo-check",
+      "--ignore-rules",
+      "-m",
+      state.ai.model,
+      "-c",
+      `model_reasoning_effort="${state.ai.reasoningEffort}"`,
+      "-o",
+      outputPath,
+      ...chatArgs,
+      ...imageArgs,
+      sessionId,
+      "-"
+    ];
+  }
+  return [
+    "exec",
+    "--skip-git-repo-check",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "-s",
+    "read-only",
+    "-m",
+    state.ai.model,
+    "-c",
+    `model_reasoning_effort="${state.ai.reasoningEffort}"`,
+    "-C",
+    codexWorkspaceDir,
+    "-o",
+    outputPath,
+    ...chatArgs,
+    ...imageArgs,
+    "-"
+  ];
+}
+
 async function loadQqPersonas() {
   await mkdir(dataDir, { recursive: true });
   try {
@@ -421,6 +552,8 @@ async function loadSettings() {
   await mkdir(dataDir, { recursive: true });
   try {
     const body = JSON.parse(await readFile(settingsPath, "utf8"));
+    if (typeof body.channels?.qq === "boolean") state.channels.qq = body.channels.qq;
+    if (!isWindows && typeof body.channels?.imessage === "boolean") state.channels.imessage = body.channels.imessage;
     if (Array.isArray(body.qq?.allowedGroups)) {
       state.qq.allowedGroups = normalizeAllowedGroups(body.qq.allowedGroups);
     }
@@ -506,6 +639,7 @@ async function saveSettings() {
     JSON.stringify({
       version: 1,
       updatedAt: new Date().toISOString(),
+      channels: { ...state.channels },
       ai: {
         model: state.ai.model,
         reasoningEffort: state.ai.reasoningEffort,
@@ -665,6 +799,8 @@ async function saveRemoteExecutionMemory() {
 }
 
 function buildPublicState() {
+  state.maintenance.codex.appServer = qqAppServer?.snapshot() || { transport: process.env.CODEX_QQ_TRANSPORT === "exec" ? "exec" : "app-server", ready: false, activeTurns: 0, loadedThreads: 0 };
+  state.maintenance.codex.queuedConversations = qqReplyTasks.size;
   const memoryCounts = Object.fromEntries(
     Object.entries(state.qq.memory.entries).map(([groupId, entries]) => [groupId, entries.length])
   );
@@ -1330,7 +1466,8 @@ async function fetchOneBotImage(file) {
   const response = await fetch(`${oneBotApiBase}/get_image`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ file: String(file || ""), download: true })
+    body: JSON.stringify({ file: String(file || ""), download: true }),
+    signal: AbortSignal.timeout(10000)
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok || (body.status != null && body.status !== "ok")) {
@@ -1739,7 +1876,118 @@ function cleanCodexReply(text) {
     .trim();
 }
 
+let qqAppServer = null;
+
+async function getQqAppServer() {
+  if (qqAppServer) return qqAppServer;
+  const catalogArgs = await getQqCatalogArgs();
+  // A concurrent first conversation may already have created the shared client.
+  if (qqAppServer) return qqAppServer;
+  qqAppServer = new QqAppServer(codexCliPath, ["app-server", "--listen", "stdio://",
+    ...["apps", "plugins", "remote_plugin", "shell_snapshot", "shell_tool", "skill_search"].flatMap(name => ["--disable", name]),
+    "-c", "agents.enabled=false", "-c", "skills.bundled.enabled=false",
+    "-c", "skills.include_instructions=false",
+    "-c", `model_instructions_file=${JSON.stringify(join(__dirname, "qq-model-instructions.txt"))}`,
+    ...catalogArgs
+  ], {
+    cwd: codexWorkspaceDir,
+    env: { ...qqCodexEnv }
+  });
+  return qqAppServer;
+}
+
+async function runQqPersistentTurn(event, prompt, outputPath, imagePaths) {
+  const key = qqConversationKey(event);
+  const client = await getQqAppServer();
+  const startedAt = Date.now();
+  const previousQuota = state.maintenance.codex.quota;
+  try {
+    const result = await client.run({
+      sessionId: key ? qqSessions[key] || "" : "", prompt, imagePaths,
+      model: state.ai.model, effort: state.ai.reasoningEffort,
+      baseInstructions: await readFile(join(__dirname, "qq-model-instructions.txt"), "utf8"),
+      onSession: async sessionId => {
+        if (key && qqSessions[key] !== sessionId) { qqSessions[key] = sessionId; await saveQqSessions(); }
+      }
+    });
+    await writeFile(outputPath, result.finalText);
+    event.latency ||= {};
+    event.latency.transport = "app-server";
+    event.latency.modelMs = (event.latency.modelMs || 0) + result.timing.completedMs;
+    event.latency.modelTurns = (event.latency.modelTurns || 0) + 1;
+    event.latency.inputTokens = result.usage?.input_tokens ?? null;
+    event.latency.cachedInputTokens = result.usage?.cached_input_tokens ?? null;
+    event.latency.setupMs = (event.latency.setupMs || 0) + result.timing.setupMs;
+    event.latency.firstMessageMs = result.timing.firstMessageMs;
+    Object.assign(state.maintenance.codex, { lastRunAt: new Date().toISOString(),
+      lastDurationMs: Date.now() - startedAt, lastOk: true, lastError: null });
+    refreshCodexQuotaSnapshotAfterRun({ startedAtMs: startedAt, previousQuota }).catch(() => null);
+    return result;
+  } catch (error) {
+    Object.assign(state.maintenance.codex, { lastDurationMs: Date.now() - startedAt, lastOk: false, lastError: error.message });
+    throw error;
+  } finally { state.maintenance.codex.appServer = client.snapshot(); }
+}
+
+async function runQqCodexTurn(event, prompt, outputPath, imagePaths) {
+  if (process.env.CODEX_QQ_TRANSPORT !== "exec") return runQqPersistentTurn(event, prompt, outputPath, imagePaths);
+  const key = qqConversationKey(event);
+  const options = {
+    cwd: codexWorkspaceDir,
+    timeout: 120000,
+    returnOnTurnComplete: true,
+    env: { ...qqCodexEnv }
+  };
+  const catalogArgs = await getQqCatalogArgs();
+  const remember = async (result) => {
+    const nextSessionId = result.sessionId || extractCodexSessionId(result.stderr);
+    if (!key || !nextSessionId || qqSessions[key] === nextSessionId) return;
+    qqSessions[key] = nextSessionId;
+    await saveQqSessions();
+  };
+  const finish = async (result) => {
+    if (result.finalText != null) await writeFile(outputPath, result.finalText);
+    await remember(result);
+    event.latency ||= {};
+    event.latency.modelMs = (event.latency.modelMs || 0) + (result.timing?.completedMs || 0);
+    event.latency.modelTurns = (event.latency.modelTurns || 0) + 1;
+    event.latency.cumulativeInputTokens = result.usage?.input_tokens ?? null;
+    event.latency.transport = "exec";
+    return result;
+  };
+  const sessionId = key ? qqSessions[key] || "" : "";
+  try {
+    const result = await runCodexCli(buildQqCodexArgs({ sessionId, outputPath, imagePaths, catalogArgs }), prompt, options);
+    return await finish(result);
+  } catch (error) {
+    if (!sessionId || /timed out/i.test(error.message)) throw error;
+    delete qqSessions[key];
+    await saveQqSessions();
+    const result = await runCodexCli(buildQqCodexArgs({ outputPath, imagePaths, catalogArgs }), prompt, options);
+    return await finish(result);
+  }
+}
+
 async function buildModelReply(event) {
+  const key = qqConversationKey(event) || crypto.randomUUID();
+  const queuedAt = Date.now();
+  const previous = qqReplyTasks.get(key) || Promise.resolve();
+  const task = previous.catch(() => null).then(async () => {
+    const startedAt = Date.now();
+    event.latency = { queueMs: startedAt - queuedAt, modelTurns: 0, modelMs: 0 };
+    try {
+      return await buildModelReplyUnqueued(event);
+    } finally {
+      delete event.imagePaths;
+      event.latency.generationMs = Date.now() - startedAt;
+    }
+  });
+  qqReplyTasks.set(key, task);
+  try { return await task; }
+  finally { if (qqReplyTasks.get(key) === task) qqReplyTasks.delete(key); }
+}
+
+async function buildModelReplyUnqueued(event) {
   const text = stripMentionText(event.text);
   const id = crypto.randomUUID();
   const outputPath = join(codexTmpDir, `${id}.txt`);
@@ -1747,17 +1995,24 @@ async function buildModelReply(event) {
   let memoryContext = formatMemoryContext(event, { expandLevel: 0 });
   const personaContext = formatQqPersonaContext(event);
   const repetitionGuard = state.qq.enhancer.enabled ? buildQqRepetitionGuard(event) : "";
+  const lookupStarted = Date.now();
   const webContext = await buildWebLookupContext(event);
+  event.latency.webLookupMs = Date.now() - lookupStarted;
   const stickerCatalog = state.qq.enhancer.enabled ? await buildQqStickerCatalog(qqStickerDir) : [];
   const qqModelImages = getQqModelImageInputs(event, text);
   const shouldInspectImages = qqModelImages.length > 0;
+  let imageFailures = 0;
   const imagePaths = shouldInspectImages
     ? await prepareQqModelImages(qqModelImages, {
       outputDir: join(projectDir, "tmp", "qq-images"),
-      fetchOneBotImage
+      fetchOneBotImage,
+      onError: () => { imageFailures += 1; }
     })
     : [];
   event.imagePaths = imagePaths;
+  event.latency.imageReferences = qqModelImages.length;
+  event.latency.imagePrepared = imagePaths.length;
+  event.latency.imageFailures = imageFailures;
   const buildReplyPrompt = async (memoryBlock, expandLevel = 0, forceLocalReply = false) => [
     await buildAssistantInstructions(event),
     "",
@@ -1780,6 +2035,7 @@ async function buildModelReply(event) {
     hasAnyQqImageReference(event) && !shouldInspectImages ? "本条 QQ 消息或引用消息带了图片，但文本兴趣不足或未明确要求看图；Hub 已跳过视觉输入以节省 token。不要声称看过图片内容。" : null,
     shouldInspectImages ? `收到的 QQ 图片：${formatQqImageSummary(qqModelImages)}` : null,
     imagePaths.length ? `可查看的本地图片数量：${imagePaths.length}` : null,
+    shouldInspectImages && !imagePaths.length ? "图片下载失败，尚未看到图像内容。请简短请对方重发图片，不要猜测图中内容。" : null,
     imagePaths.length ? "请结合图片内容回复。不要过度保守：只要能看清主元素、文字、构图或梗图大意，就先说你看到了什么并给出判断；只有完全无法辨认主体时才说看不清。" : null,
     hasAnyQqImageReference(event) ? "" : null,
     state.qq.enhancer.enabled ? "本地表情包库：" : null,
@@ -1787,7 +2043,7 @@ async function buildModelReply(event) {
     state.qq.enhancer.enabled && stickerCatalog.length ? "表情包库可用时，部署者可以在自定义 profile 或 QQ enhancer 包中说明何时使用 [[qq_sticker:表情包名]]；只能选择提示里真实存在的表情包名。" : null,
     "",
     event.type === "private_message" ? "收到的 QQ 私聊：" : "收到的群消息：",
-    text || "对方只 @ 了你，没有附加具体内容。",
+    text || (shouldInspectImages ? "对方只发送了图片，请识别图片并回应。" : "对方只 @ 了你，没有附加具体内容。"),
     "",
     forceLocalReply ? "不要再请求更多上下文，也不要输出任何内部标记。请基于当前消息、引用、图片和已经给到的上下文，给出自然回复。" : null,
     forceLocalReply ? "" : null,
@@ -1798,62 +2054,21 @@ async function buildModelReply(event) {
 
   await ensureCodexReplyWorkspace();
 
-  const args = [
-    "exec",
-    "--ephemeral",
-    "--ignore-user-config",
-    "--skip-git-repo-check",
-    "--ignore-rules",
-    "-s",
-    "read-only",
-    "-m",
-    state.ai.model,
-    "-c",
-    `model_reasoning_effort="${state.ai.reasoningEffort}"`,
-    "-C",
-    codexWorkspaceDir,
-    "-o",
-    outputPath,
-    ...imagePaths.flatMap((imagePath) => ["--image", imagePath]),
-    "-"
-  ];
-
   let prompt = await buildReplyPrompt(memoryContext, 0);
-  await runCodexCli(args, prompt, {
-    cwd: codexWorkspaceDir,
-    timeout: 120000,
-    env: {
-      ...process.env,
-      CODEX_REMOTE_CONTACT_QQ_MODE: "1"
-    }
-  });
+  await runQqCodexTurn(event, prompt, outputPath, imagePaths);
 
   let baseReply = cleanCodexReply(await readFile(outputPath, "utf8"));
   if (shouldRequestExpandedQqContext(baseReply)) {
     memoryContext = formatMemoryContext(event, { expandLevel: 1 });
     if (memoryContext) {
       prompt = await buildReplyPrompt(memoryContext, 1);
-      await runCodexCli(args, prompt, {
-        cwd: codexWorkspaceDir,
-        timeout: 120000,
-        env: {
-          ...process.env,
-          CODEX_REMOTE_CONTACT_QQ_MODE: "1"
-        }
-      });
+      await runQqCodexTurn(event, prompt, outputPath, imagePaths);
       baseReply = cleanCodexReply(await readFile(outputPath, "utf8"));
     }
   }
   if (shouldRequestExpandedQqContext(baseReply)) {
     prompt = await buildReplyPrompt(memoryContext, 1, true);
-    await runCodexCli(args, prompt, {
-      cwd: codexWorkspaceDir,
-      timeout: 120000,
-      env: {
-        ...process.env,
-        CODEX_REMOTE_CONTACT_QQ_MODE: "1"
-      }
-    });
+    await runQqCodexTurn(event, prompt, outputPath, imagePaths);
     baseReply = cleanCodexReply(await readFile(outputPath, "utf8"));
   }
   const reply = state.qq.enhancer.enabled
@@ -2150,6 +2365,12 @@ function shouldUseWebLookup(event, text) {
   const normalized = String(text || "").trim();
   if (!state.qq.webLookup.enabled || !normalized) return false;
   if (isFilesystemProbe(normalized)) return false;
+  // Identity/relationship small talk has no external fact to look up. Keep
+  // explicit search requests working, including questions about real people.
+  if (!/(查一下|搜一下|搜索|联网|网上|百科|新闻|最新)/i.test(normalized)
+      && /^(?:请问|那|所以)?(?:你|您)(?:的)?(?:主人|管理员|名字|名称|身份|模型|昵称|作者|开发者|创造者|老板|背后的人)?(?:到底|究竟|现在)?(?:是|叫|用的?是?)(?:谁|什么|哪个|哪位)/.test(normalized.replace(/[\s，,。.!！?？]/g, ""))) return false;
+  if (!/(查一下|搜一下|搜索|联网|网上|百科|新闻|最新)/i.test(normalized)
+      && /(刚才|刚刚|上一句|上条|上文|前面|这段对话|我们聊|我说过|你说过|测试代号)/.test(normalized)) return false;
   if (/(是什么意思|什么意思|啥意思|什么梗|啥梗|什么定义|定义|是谁|谁是|是什么东西|是什么|百科|查一下|搜一下|网上|最近|最新|新闻|出处|来源)/i.test(normalized)) return true;
   if (/(最好|最好用|推荐|排行|排名|强度|攻略|通关|配装|卡牌|角色|装备|技能|流派|打法|弱点|结局|路线|隐藏|解锁|mod|MOD|版本|补丁)/i.test(normalized)
     && /(游戏|手游|Steam|steam|Switch|switch|主机|东方|虹龙洞|原神|崩铁|明日方舟|碧蓝|gal|galgame|GameCube|GC|任天堂|索尼|Xbox|xbox|卡牌|角色|装备|关卡)/i.test(normalized)) {
@@ -2197,7 +2418,7 @@ function hasPendingQqImageRequest(event) {
 function shouldInspectQqImages(event, text) {
   if (!hasAnyQqImageReference(event)) return false;
   if (event.proactiveDecision?.inspectImages || event.pendingImageRequestText) return true;
-  if (isExplicitQqAtEvent(event)) return true;
+  if (event.type === "private_message" || isExplicitQqAtEvent(event)) return true;
   if (Array.isArray(event.replyContext?.images) && event.replyContext.images.length > 0) return true;
   const normalized = String(text || "").trim();
   if (!normalized) return false;
@@ -2238,17 +2459,21 @@ async function searchWeb(query) {
     const preferredProvider = chooseWebSearchProvider();
     state.maintenance.webLookup.effectiveProvider = preferredProvider;
 
-    if (shouldUseWikipediaForQuery(query)) {
+    let providerError = null;
+    await collectSearchProviderResults(preferredProvider, queryVariants, controller.signal, webResults)
+      .catch(error => { providerError = error; });
+    // A slow encyclopedia must not consume the entire budget before the normal
+    // search provider gets a chance. Preserve any usable results on timeout.
+    if (!webResults.length && !controller.signal.aborted && shouldUseWikipediaForQuery(query)) {
       for (const variant of queryVariants.slice(0, 2)) {
         const hits = await searchWikipedia(variant, controller.signal).catch(() => []);
         wikipediaResults.push(...hits);
-        if (wikipediaResults.length >= 2) break;
+        if (wikipediaResults.length >= 2 || controller.signal.aborted) break;
       }
     }
-
-    await collectSearchProviderResults(preferredProvider, queryVariants, controller.signal, webResults);
+    if (!webResults.length && !wikipediaResults.length && providerError) throw providerError;
     const results = mergeSearchResults([...wikipediaResults, ...webResults]).slice(0, 5);
-    const enriched = await enrichWebResults(results);
+    const enriched = await enrichWebResults(results, controller.signal);
     state.maintenance.webLookup.lastOk = true;
     state.maintenance.webLookup.lastError = null;
     state.maintenance.webLookup.lastDurationMs = Date.now() - startedAt;
@@ -2274,7 +2499,7 @@ async function collectSearchProviderResults(provider, queryVariants, signal, out
   for (const variant of queryVariants.slice(0, 4)) {
     const hits = await searchDuckDuckGo(variant, signal);
     output.push(...hits);
-    if (output.length >= 5) return;
+    if (output.length >= 3) return;
   }
 }
 
@@ -2394,13 +2619,13 @@ function mergeSearchResults(results) {
   });
 }
 
-async function enrichWebResults(results) {
+async function enrichWebResults(results, signal) {
   const enriched = [];
   for (const result of results) {
     if (!result.snippet && result.source !== "wikipedia" && enriched.length < 2 && result.url) {
       enriched.push({
         ...result,
-        snippet: await fetchPageSnippet(result.url).catch(() => "")
+        snippet: await fetchPageSnippet(result.url, signal).catch(() => "")
       });
     } else {
       enriched.push(result);
@@ -2409,12 +2634,12 @@ async function enrichWebResults(results) {
   return enriched;
 }
 
-async function fetchPageSnippet(url) {
+async function fetchPageSnippet(url, parentSignal) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Math.min(3500, qqWebLookupTimeoutMs));
   try {
     const response = await fetch(url, {
-      signal: controller.signal,
+      signal: parentSignal ? AbortSignal.any([controller.signal, parentSignal]) : controller.signal,
       headers: { "user-agent": userAgentName }
     });
     if (!response.ok) return "";
@@ -3491,6 +3716,7 @@ async function executeIMessageCommand(text, event = null) {
     state.qq.memory.entries = {};
     state.qq.memory.recentMessages = {};
     await saveQqMemory();
+    await clearQqSessions();
     return { ok: true, summary: "QQ memory cleared", reply: "QQ 轻量记忆已清空。" };
   }
   if (/^(清除记忆|清空记忆|清理记忆|重置记忆|忘记上下文)$/.test(normalized)) {
@@ -5615,6 +5841,29 @@ function formatQuotedContext(event) {
 }
 
 function runCodexCli(args, input, options) {
+  if (options.returnOnTurnComplete) {
+    const startedAt = Date.now();
+    const previousQuota = state.maintenance.codex.quota;
+    return runQqCodexJson(codexCliPath, args, input, {
+      ...options,
+      onClose: timing => {
+        state.maintenance.codex.lastProcessCloseMs = timing.closeMs;
+        state.maintenance.codex.lastCleanupMs = timing.completedMs == null ? null : timing.closeMs - timing.completedMs;
+      }
+    }).then(result => {
+      state.maintenance.codex.lastRunAt = new Date().toISOString();
+      state.maintenance.codex.lastDurationMs = Date.now() - startedAt;
+      state.maintenance.codex.lastOk = true;
+      state.maintenance.codex.lastError = null;
+      refreshCodexQuotaSnapshotAfterRun({ startedAtMs: startedAt, previousQuota }).catch(() => null);
+      return result;
+    }, error => {
+      state.maintenance.codex.lastDurationMs = Date.now() - startedAt;
+      state.maintenance.codex.lastOk = false;
+      state.maintenance.codex.lastError = error.message;
+      throw error;
+    });
+  }
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const previousQuota = state.maintenance.codex.quota;
@@ -5667,9 +5916,8 @@ function runCodexCli(args, input, options) {
       if (code === 0) {
         state.maintenance.codex.lastOk = true;
         state.maintenance.codex.lastError = null;
-        refreshCodexQuotaSnapshotAfterRun({ startedAtMs: startedAt, previousQuota }).catch(() => null).finally(() => {
-          resolve({ stdout, stderr });
-        });
+        resolve({ stdout, stderr });
+        refreshCodexQuotaSnapshotAfterRun({ startedAtMs: startedAt, previousQuota }).catch(() => null);
       } else {
         const message = `Codex CLI exited with ${code}: ${(stderr || stdout).trim()}`;
         state.maintenance.codex.lastOk = false;
@@ -6009,6 +6257,18 @@ function rememberEvent(key) {
   return false;
 }
 
+async function recordQqLatency(record, startedAt) {
+  if (!record.decision?.ok) return;
+  record.latency = { ...record.event.latency, totalMs: Date.now() - startedAt };
+  state.maintenance.qqReply = { lastRunAt: new Date().toISOString(), ...record.latency };
+  // Durations only: no chat bodies, QQ identifiers, reply text, or credentials.
+  await appendFile(join(projectDir, "runtime", "qq-latency.jsonl"), JSON.stringify({
+    at: new Date().toISOString(), source: record.source,
+    type: record.event.type, ok: !record.error && record.send?.ok !== false,
+    ...record.latency
+  }) + "\n").catch(() => null);
+}
+
 async function handleApi(req, res) {
   if (req.method === "OPTIONS") {
     res.writeHead(204, corsHeaders());
@@ -6039,6 +6299,7 @@ async function handleApi(req, res) {
       return sendJson(res, 400, { error: state.imessage.lastError });
     }
     state.channels[body.channel] = Boolean(body.enabled);
+    await saveSettings();
     if (body.channel === "imessage") updateIMessagePoller();
     return sendJson(res, 200, buildPublicState());
   }
@@ -6083,10 +6344,12 @@ async function handleApi(req, res) {
       delete state.qq.memory.entries[String(body.groupId)];
       delete state.qq.memory.recentMessages[String(body.groupId)];
       delete state.qq.personas.groups[String(body.groupId)];
+      await clearQqSessions(`group:${body.groupId}`);
     } else {
       state.qq.memory.entries = {};
       state.qq.memory.recentMessages = {};
       state.qq.personas.groups = {};
+      await clearQqSessions();
     }
     await saveQqMemory();
     await saveQqPersonas();
@@ -6113,10 +6376,12 @@ async function handleApi(req, res) {
         delete state.qq.memory.entries[id];
         delete state.qq.memory.recentMessages[id];
         delete state.qq.personas.groups[id];
+        await clearQqSessions(`group:${id}`);
       } else {
         state.qq.memory.entries = {};
         state.qq.memory.recentMessages = {};
         state.qq.personas.groups = {};
+        await clearQqSessions();
       }
       await saveQqMemory();
       await saveQqPersonas();
@@ -6126,6 +6391,8 @@ async function handleApi(req, res) {
   }
 
   if (req.method === "POST" && req.url === "/api/qq/event") {
+    const requestStarted = Date.now();
+    const receivedAt = new Date().toISOString();
     const event = enrichQqEvent(await readBody(req));
     await rememberQqGroupMessage(event);
     const decision = shouldRespondToQq(event);
@@ -6145,7 +6412,7 @@ async function handleApi(req, res) {
     }
     const record = {
       id: crypto.randomUUID(),
-      receivedAt: new Date().toISOString(),
+      receivedAt,
       source: "qq",
       event,
       decision,
@@ -6154,12 +6421,15 @@ async function handleApi(req, res) {
     };
     if (record.reply) await rememberQqExchange(event, record.reply);
     if (record.reply && commandAction?.afterSend) await commandAction.afterSend();
+    await recordQqLatency(record, requestStarted);
     state.qq.events.unshift(record);
     state.qq.events = state.qq.events.slice(0, 30);
     return sendJson(res, 200, { status: "ok" });
   }
 
   if (req.method === "POST" && req.url === "/api/onebot/event") {
+    const requestStarted = Date.now();
+    const receivedAt = new Date().toISOString();
     const payload = await readBody(req);
     if (payload.post_type !== "message" || !["group", "private"].includes(payload.message_type)) {
       return sendJson(res, 200, { ignored: true, reason: "Only group/private message events are handled" });
@@ -6170,7 +6440,7 @@ async function handleApi(req, res) {
     if (rememberEvent(dedupeKey)) {
       const record = {
         id: crypto.randomUUID(),
-        receivedAt: new Date().toISOString(),
+        receivedAt,
         source: "onebot",
         event,
         decision: { ok: false, reason: "Duplicate OneBot message ignored" },
@@ -6202,7 +6472,7 @@ async function handleApi(req, res) {
     }
     const record = {
       id: crypto.randomUUID(),
-      receivedAt: new Date().toISOString(),
+      receivedAt,
       source: "onebot",
       event,
       decision,
@@ -6227,6 +6497,7 @@ async function handleApi(req, res) {
     }
     if (record.reply && record.send?.ok !== false && commandAction?.afterSend) await commandAction.afterSend();
     if (record.reply && record.send?.ok !== false) await rememberQqExchange(event, record.reply);
+    await recordQqLatency(record, requestStarted);
     state.qq.events.unshift(record);
     state.qq.events = state.qq.events.slice(0, 30);
     return sendJson(res, 200, { status: "ok" });
@@ -6254,6 +6525,7 @@ await loadSettings();
 await mkdir(qqStickerDir, { recursive: true });
 await loadQqMemory();
 await loadQqPersonas();
+await loadQqSessions();
 await loadIMessageMemory();
 await loadRemoteExecutionMemory();
 updateIMessagePoller();

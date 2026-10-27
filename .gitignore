@@ -30,5 +30,7 @@ runtime/replies/*
 # Local state
 data/keep-awake.pid
 data/previous-brightness.txt
+data/qq-sessions.json
+data/*.tmp
 modules/system-control/bin/
 config/local.codexremotecontact.chat-hub.plist
